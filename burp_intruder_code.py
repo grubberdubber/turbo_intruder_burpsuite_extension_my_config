@@ -110,23 +110,9 @@ results = {}
 
 def random_token(length=TOKEN_LENGTH):
     """
-    Generate a simple alphanumeric token.
-
-    Turbo Intruder also provides payload helpers such as
-    $randomplz, but generating the value here makes the
-    experiment state explicit and reproducible.
+    Devuelve el cupón fijo del laboratorio para las pruebas de race condition.
     """
-
-    alphabet = (
-        "abcdefghijklmnopqrstuvwxyz"
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-        "0123456789"
-    )
-
-    return "".join(
-        alphabet[__import__("random").randint(0, len(alphabet) - 1)]
-        for _ in range(length)
-    )
+    return "verano2026"  # <-- Pon aquí el nombre exacto de tu cupón
 
 
 def parse_label(label):
