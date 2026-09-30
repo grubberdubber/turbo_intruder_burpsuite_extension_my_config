@@ -3,21 +3,21 @@
 # Designed for authorized local/containerized labs.
 #
 # Features:
-#   - Burst matrix: 10 / 20 / 30 / 40 / 50 requests
-#   - Multiple independent trials per burst size
-#   - HTTP/2 single-packet attack using BURP2 + gates
-#   - Per-trial labels for reliable response attribution
-#   - Warmup separated from experiment statistics
-#   - Trial success rate
-#   - Response success rate
-#   - HTTP status distribution
-#   - Response timing statistics
-#   - Response ordering
-#   - Final experiment summary
+#    - Burst matrix: 10 / 20 / 30 / 40 / 50 requests
+#    - Multiple independent trials per burst size
+#    - HTTP/2 single-packet attack using BURP2 + gates
+#    - Per-trial labels for reliable response attribution
+#    - Warmup separated from experiment statistics
+#    - Trial success rate
+#    - Response success rate
+#    - HTTP status distribution
+#    - Response timing statistics
+#    - Response ordering
+#    - Final experiment summary
 #
 # IMPORTANT:
-#   You MUST customize is_success() for the specific lab.
-#   HTTP 200 alone is NOT automatically considered a race success.
+#    You MUST customize is_success() for the specific lab.
+#    HTTP 200 alone is NOT automatically considered a race success.
 
 
 # ============================================================
@@ -38,10 +38,10 @@ WARMUP_ENABLED = True
 # Reuse one value across the entire burst?
 #
 # True:
-#   Every request in a burst uses the same generated token.
+#    Every request in a burst uses the same generated token.
 #
 # False:
-#   Every request receives a different token.
+#    Every request receives a different token.
 #
 # Choose according to the lab's semantics.
 SAME_PAYLOAD = True
@@ -471,6 +471,7 @@ def queueRequests(target, wordlists):
 
         engine.queue(
             target.req,
+            gate="warmup",
             label="warmup"
         )
 
